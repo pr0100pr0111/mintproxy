@@ -136,6 +136,14 @@ ENV/
 env.bak/
 venv.bak/
 
+# Database files
+payments.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Local config
+
 # Spyder project settings
 .spyderproject
 .spyproject

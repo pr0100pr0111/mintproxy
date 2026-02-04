@@ -7,13 +7,22 @@ from datetime import datetime
 import sqlite3
 from werkzeug.security import generate_password_hash, check_password_hash
 
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', os.urandom(32).hex())
 
 BANK_CARD = os.environ.get('BANK_CARD', "5599 0021 1503 7915")
 ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', "admin")
-ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', "admin")
-ADMIN_PASSWORD_HASH = generate_password_hash(ADMIN_PASSWORD) 
+ADMIN_PASSWORD_HASH = generate_password_hash(os.environ.get('ADMIN_PASSWORD', "admin"))
+
+
+# ============================================================================
+# DATABASE
+# ============================================================================
 
 def init_db():
     conn = sqlite3.connect('payments.db')
@@ -42,16 +51,17 @@ def init_db():
             pass
 
     try:
-        c.execute('''
-            CREATE INDEX IF NOT EXISTS idx_payments_status 
-            ON payments (status)
-        ''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_payments_status ON payments (status)')
     except sqlite3.Error:
         pass
 
     conn.commit()
     conn.close()
 
+
+# ============================================================================
+# DECORATORS & HELPERS
+# ============================================================================
 
 def login_required(f):
     @wraps(f)
@@ -83,6 +93,10 @@ def _generate_proxy_data(quantity):
         for _ in range(quantity)
     ]
 
+
+# ============================================================================
+# PROXIES DATA
+# ============================================================================
 
 PROXIES = {
     "europe": {
@@ -546,6 +560,11 @@ PROXY_DETAIL_HTML = """
 </section>
 """
 
+
+# ============================================================================
+# ROUTES: PUBLIC
+# ============================================================================
+
 @app.route('/')
 def home():
     return render_template_string(
@@ -800,6 +819,11 @@ def check_payment():
         )
     )
 
+
+# ============================================================================
+# ROUTES: ADMIN
+# ============================================================================
+
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
     if request.method == 'POST':
@@ -959,6 +983,10 @@ if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=False)
 
 
+# ============================================================================
+# ERROR HANDLERS
+# ============================================================================
+
 @app.errorhandler(404)
 def page_not_found(error):
     return render_template_string(BASE_HTML.format(
@@ -991,3 +1019,11 @@ def server_error(error):
         ''',
         year=datetime.now().year
     )), 500
+
+
+# ============================================================================
+# RUN
+# ============================================================================
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080, debug=False)
