@@ -1,21 +1,24 @@
 from flask import Flask, render_template_string, request, redirect, session
+from functools import wraps
 import random
+import json
+import os
 from datetime import datetime
 import sqlite3
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.secret_key = 'ваш_секретный_ключ' 
+app.secret_key = os.environ.get('SECRET_KEY', os.urandom(32).hex())
 
-BANK_CARD = "5599 0021 1503 7915"  
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD_HASH = generate_password_hash("FuckingParolMazafaka1337") 
+BANK_CARD = os.environ.get('BANK_CARD', "5599 0021 1503 7915")
+ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', "admin")
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', "admin")
+ADMIN_PASSWORD_HASH = generate_password_hash(ADMIN_PASSWORD) 
 
 def init_db():
     conn = sqlite3.connect('payments.db')
     c = conn.cursor()
 
-    # Создаем новую таблицу с актуальной структурой
     c.execute('''
         CREATE TABLE IF NOT EXISTS payments (
             payment_id TEXT PRIMARY KEY,
@@ -29,77 +32,57 @@ def init_db():
         )
     ''')
 
-    # Проверяем существующие колонки
     c.execute("PRAGMA table_info(payments)")
     columns = [column[1] for column in c.fetchall()]
 
-    # Добавляем недостающие колонки
     if 'quantity' not in columns:
         try:
             c.execute("ALTER TABLE payments ADD COLUMN quantity INTEGER NOT NULL DEFAULT 1")
-            print("Добавлена колонка quantity")
-        except sqlite3.Error as e:
-            print(f"Ошибка при добавлении колонки quantity: {e}")
+        except sqlite3.Error:
+            pass
 
-    conn.commit()
-
-    # Создаем индекс для ускорения поиска по статусу
     try:
         c.execute('''
             CREATE INDEX IF NOT EXISTS idx_payments_status 
             ON payments (status)
         ''')
-    except sqlite3.Error as e:
-        print(f"Ошибка при создании индекса: {e}")
+    except sqlite3.Error:
+        pass
 
     conn.commit()
     conn.close()
 
-# Добавьте эту функцию для миграции существующих данных
-def migrate_db():
-    conn = sqlite3.connect('payments.db')
-    c = conn.cursor()
 
-    try:
-        # Создаем временную таблицу с новой структурой
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS payments_new (
-                payment_id TEXT PRIMARY KEY,
-                region_id TEXT NOT NULL,
-                country_id TEXT NOT NULL,
-                amount REAL NOT NULL,
-                quantity INTEGER NOT NULL DEFAULT 1,
-                status TEXT NOT NULL DEFAULT 'pending',
-                proxy_data TEXT,
-                timestamp DATETIME NOT NULL
-            )
-        ''')
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('admin_logged_in'):
+            return redirect('/admin/login')
+        return f(*args, **kwargs)
+    return decorated_function
 
-        # Копируем данные из старой таблицы
-        c.execute('''
-            INSERT INTO payments_new 
-            (payment_id, region_id, country_id, amount, status, proxy_data, timestamp)
-            SELECT payment_id, region_id, country_id, amount, status, proxy_data, timestamp 
-            FROM payments
-        ''')
 
-        # Удаляем старую таблицу
-        c.execute("DROP TABLE payments")
+def _validate_region_country(region_id, country_id):
+    return region_id in PROXIES and country_id in PROXIES[region_id]["countries"]
 
-        # Переименовываем новую таблицу
-        c.execute("ALTER TABLE payments_new RENAME TO payments")
 
-        conn.commit()
-        print("Миграция базы данных успешно завершена")
-    except sqlite3.Error as e:
-        conn.rollback()
-        print(f"Ошибка миграции: {e}")
-    finally:
-        conn.close()
+def _get_country_name(region_id, country_id):
+    if _validate_region_country(region_id, country_id):
+        return PROXIES[region_id]["countries"][country_id]["name"]
+    return "Неизвестная страна"
 
-# Вызываем функции при старте приложения
-init_db()
-migrate_db()
+
+def _generate_proxy_data(quantity):
+    return [
+        {
+            "ip": ".".join(str(random.randint(0, 255)) for _ in range(4)),
+            "port": random.randint(1000, 9999),
+            "login": f"user{random.randint(1000, 9999)}",
+            "password": f"pass{random.randint(10000, 99999)}"
+        }
+        for _ in range(quantity)
+    ]
+
 
 PROXIES = {
     "europe": {
@@ -585,63 +568,64 @@ def proxies():
 
 @app.route('/proxy/<region_id>/<country_id>')
 def proxy_detail(region_id, country_id):
-        if region_id in PROXIES and country_id in PROXIES[region_id]["countries"]:
-            proxy = PROXIES[region_id]["countries"][country_id]
-            return render_template_string(
-                BASE_HTML.format(
-                    title=f"{proxy['name']} прокси",
-                    content=f'''
-                    <section style="padding: 80px 0; text-align: center; min-height: calc(100vh - 200px);">
-                        <div class="container">
-                            <h2 style="font-size: 2rem; margin-bottom: 20px;">{proxy['name']} прокси</h2>
-                            <div style="max-width: 500px; margin: 0 auto; background: var(--text-light); 
-                                 padding: 30px; border-radius: 12px; box-shadow: 0 5px 15px rgba(0,0,0,0.1);">
-                                <p style="font-size: 1.2rem; margin-bottom: 15px;">Цена: <strong>{proxy['price']}₽</strong> за 1 прокси</p>
-
-                                <form action="/create_payment/{region_id}/{country_id}" method="GET">
-                                    <div style="margin-bottom: 25px; text-align: left;">
-                                        <label for="quantity" style="display: block; margin-bottom: 8px; font-weight: 600;">Количество прокси:</label>
-                                        <select id="quantity" name="quantity" style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px;">
-                                            <option value="1">1 прокси - {proxy['price']}₽</option>
-                                            <option value="2">2 прокси - {proxy['price']*2}₽</option>
-                                            <option value="5">5 прокси - {proxy['price']*5}₽</option>
-                                            <option value="10">10 прокси - {proxy['price']*10}₽</option>
-                                            <option value="20">20 прокси - {proxy['price']*20}₽</option>
-                                        </select>
-                                    </div>
-
-                                    <button type="submit" class="btn" style="width: 100%;">
-                                        Оплатить
-                                    </button>
-                                </form>
-                            </div>
-                        </div>
-                    </section>
-                    ''',
-                    year=datetime.now().year
-                )
-            )
+    if not _validate_region_country(region_id, country_id):
         return redirect('/proxies')
+
+    proxy = PROXIES[region_id]["countries"][country_id]
+    quantity_options = [
+        (1, proxy['price']),
+        (2, proxy['price'] * 2),
+        (5, proxy['price'] * 5),
+        (10, proxy['price'] * 10),
+        (20, proxy['price'] * 20)
+    ]
+
+    return render_template_string(
+        BASE_HTML.format(
+            title=f"{proxy['name']} прокси",
+            content=f'''
+            <section style="padding: 80px 0; text-align: center; min-height: calc(100vh - 200px);">
+                <div class="container">
+                    <h2 style="font-size: 2rem; margin-bottom: 20px;">{proxy['name']} прокси</h2>
+                    <div style="max-width: 500px; margin: 0 auto; background: var(--text-light); 
+                         padding: 30px; border-radius: 12px; box-shadow: 0 5px 15px rgba(0,0,0,0.1);">
+                        <p style="font-size: 1.2rem; margin-bottom: 15px;">Цена: <strong>{proxy['price']}₽</strong> за 1 прокси</p>
+
+                        <form action="/create_payment/{region_id}/{country_id}" method="GET">
+                            <div style="margin-bottom: 25px; text-align: left;">
+                                <label for="quantity" style="display: block; margin-bottom: 8px; font-weight: 600;">Количество прокси:</label>
+                                <select id="quantity" name="quantity" style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px;">
+                                    {chr(10).join(f'<option value="{qty}">{qty} прокси - {price}₽</option>' for qty, price in quantity_options)}
+                                </select>
+                            </div>
+
+                            <button type="submit" class="btn" style="width: 100%;">
+                                Оплатить
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            </section>
+            ''',
+            year=datetime.now().year
+        )
+    )
 
 @app.route('/create_payment/<region_id>/<country_id>')
 def create_payment(region_id, country_id):
-        if region_id not in PROXIES or country_id not in PROXIES[region_id]["countries"]:
-            return redirect('/proxies')
+    if not _validate_region_country(region_id, country_id):
+        return redirect('/proxies')
 
-        try:
-            quantity = int(request.args.get('quantity', '1'))
-        except ValueError:
-            quantity = 1
+    try:
+        quantity = max(1, min(20, int(request.args.get('quantity', '1'))))
+    except (ValueError, TypeError):
+        quantity = 1
 
-    # Ограничиваем количество от 1 до 20
-        quantity = max(1, min(20, quantity))
+    proxy = PROXIES[region_id]["countries"][country_id]
+    total_amount = proxy["price"] * quantity
+    payment_id = f"proxy_{random.randint(10000, 99999)}"
 
-        proxy = PROXIES[region_id]["countries"][country_id]
-        total_amount = proxy["price"] * quantity
-        payment_id = f"proxy_{random.randint(10000, 99999)}"
-
-    # Сохраняем данные в сессию
-        session.update({
+    session.update({
         "payment_id": payment_id,
         "region_id": region_id,
         "country_id": country_id,
@@ -649,209 +633,178 @@ def create_payment(region_id, country_id):
         "quantity": quantity
     })
 
-        # Сохраняем в базу данных
-        conn = sqlite3.connect('payments.db')
-        c = conn.cursor()
-        try:
-            c.execute('''
-                INSERT INTO payments 
-                (payment_id, region_id, country_id, amount, quantity, status, proxy_data, timestamp) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                payment_id, 
-                region_id, 
-                country_id, 
-                total_amount, 
-                quantity, 
-                'pending', 
-                '', 
-                datetime.now()
-            ))
-            conn.commit()
-        except sqlite3.Error as e:
-            print(f"Database error: {e}")
-            return redirect('/proxies')
-        finally:
-            conn.close()
+    conn = sqlite3.connect('payments.db')
+    c = conn.cursor()
+    try:
+        c.execute('''
+            INSERT INTO payments 
+            (payment_id, region_id, country_id, amount, quantity, status, proxy_data, timestamp) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (payment_id, region_id, country_id, total_amount, quantity, 'pending', '', datetime.now()))
+        conn.commit()
+    except sqlite3.Error:
+        return redirect('/proxies')
+    finally:
+        conn.close()
 
-        return render_template_string(
-            BASE_HTML.format(
-                title="Оплата на карту",
-                content=f'''
-                <section style="padding: 40px 0; text-align: center;">
-                    <div class="container" style="max-width: 600px;">
-                        <h2 style="margin-bottom: 30px;">Оплата {total_amount}₽ ({quantity} прокси)</h2>
-                        <!-- Остальная часть формы оплаты -->
-                        <div style="background: var(--text-light); padding: 25px; border-radius: 12px; margin-bottom: 30px; text-align: left;">
-                            <h3 style="color: var(--mint-dark); margin-bottom: 20px; text-align: center;">Реквизиты для перевода</h3>
-                            <div style="margin-bottom: 20px;">
-                                <p style="font-weight: bold; margin-bottom: 5px;">Номер карты:</p>
-                                <div style="display: flex; align-items: center; gap: 10px;">
-                                    <div style="background: var(--gray); padding: 10px 15px; border-radius: 6px; flex-grow: 1;">
-                                        {BANK_CARD}
-                                    </div>
-                                    <button onclick="copyToClipboard('{BANK_CARD}')" 
-                                            style="background: var(--mint-dark); color: white; border: none; border-radius: 6px; padding: 10px 15px; cursor: pointer;">
-                                        Копировать
-                                    </button>
+    return render_template_string(
+        BASE_HTML.format(
+            title="Оплата на карту",
+            content=f'''
+            <section style="padding: 40px 0; text-align: center;">
+                <div class="container" style="max-width: 600px;">
+                    <h2 style="margin-bottom: 30px;">Оплата {total_amount}₽ ({quantity} прокси)</h2>
+                    <div style="background: var(--text-light); padding: 25px; border-radius: 12px; margin-bottom: 30px; text-align: left;">
+                        <h3 style="color: var(--mint-dark); margin-bottom: 20px; text-align: center;">Реквизиты для перевода</h3>
+                        <div style="margin-bottom: 20px;">
+                            <p style="font-weight: bold; margin-bottom: 5px;">Номер карты:</p>
+                            <div style="display: flex; align-items: center; gap: 10px;">
+                                <div style="background: var(--gray); padding: 10px 15px; border-radius: 6px; flex-grow: 1;">
+                                    {BANK_CARD}
                                 </div>
+                                <button onclick="copyToClipboard('{BANK_CARD}')" 
+                                        style="background: var(--mint-dark); color: white; border: none; border-radius: 6px; padding: 10px 15px; cursor: pointer;">
+                                    Копировать
+                                </button>
                             </div>
-                            <div style="margin-bottom: 25px;">
-                                <p style="font-weight: bold; margin-bottom: 5px;">Комментарий к платежу:</p>
-                                <div style="display: flex; align-items: center; gap: 10px;">
-                                    <div style="background: var(--gray); padding: 10px 15px; border-radius: 6px; flex-grow: 1;">
-                                        {payment_id}
-                                    </div>
-                                    <button onclick="copyToClipboard('{payment_id}')" 
-                                            style="background: var(--mint-dark); color: white; border: none; border-radius: 6px; padding: 10px 15px; cursor: pointer;">
-                                        Копировать
-                                    </button>
-                                </div>
-                                <p style="font-size: 0.9rem; color: #e74c3c; margin-top: 5px;">Обязательно укажите этот комментарий!</p>
-                                <p style="font-size: 0.9rem; color: #e74c3c; margin-top: 5px;">Если комментарии к платежу недоступны, отправьте скриншот чека и комментарий на нашу почту: mintproxy@tutamail.com</p>
-                            </div>
-                            <div style="background: var(--mint-super-light); padding: 15px; border-radius: 8px; margin-bottom: 20px;">
-                                <p style="font-weight: bold; margin-bottom: 10px;">Инструкция:</p>
-                                <ol style="padding-left: 20px; margin: 0;">
-                                    <li>Скопируйте номер карты</li>
-                                    <li>Скопируйте комментарий</li>
-                                    <li>Сделайте перевод через ваш банк</li>
-                                    <li>Нажмите "Я оплатил"</li>
-                                </ol>
-                            </div>
-                            <a href="/check_payment" class="btn" style="width: 100%; text-align: center;">
-                                Я оплатил
-                            </a>
                         </div>
-                        <p style="color: #666;">
-                            Обычно проверка занимает до 15 минут
-                        </p>
+                        <div style="margin-bottom: 25px;">
+                            <p style="font-weight: bold; margin-bottom: 5px;">Комментарий к платежу:</p>
+                            <div style="display: flex; align-items: center; gap: 10px;">
+                                <div style="background: var(--gray); padding: 10px 15px; border-radius: 6px; flex-grow: 1;">
+                                    {payment_id}
+                                </div>
+                                <button onclick="copyToClipboard('{payment_id}')" 
+                                        style="background: var(--mint-dark); color: white; border: none; border-radius: 6px; padding: 10px 15px; cursor: pointer;">
+                                    Копировать
+                                </button>
+                            </div>
+                            <p style="font-size: 0.9rem; color: #e74c3c; margin-top: 5px;">Обязательно укажите этот комментарий!</p>
+                        </div>
+                        <div style="background: var(--mint-super-light); padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+                            <p style="font-weight: bold; margin-bottom: 10px;">Инструкция:</p>
+                            <ol style="padding-left: 20px; margin: 0;">
+                                <li>Скопируйте номер карты</li>
+                                <li>Скопируйте комментарий</li>
+                                <li>Сделайте перевод через ваш банк</li>
+                                <li>Нажмите "Я оплатил"</li>
+                            </ol>
+                        </div>
+                        <a href="/check_payment" class="btn" style="width: 100%; text-align: center;">
+                            Я оплатил
+                        </a>
                     </div>
-                </section>
-                <script>
-                function copyToClipboard(text) {{
-                    navigator.clipboard.writeText(text);
-                    alert('Скопировано: ' + text);
-                }}
-                </script>
-                ''',
-                year=datetime.now().year
-            )
+                    <p style="color: #666;">Обычно проверка занимает до 15 минут</p>
+                </div>
+            </section>
+            <script>
+            function copyToClipboard(text) {{
+                navigator.clipboard.writeText(text);
+                alert('Скопировано: ' + text);
+            }}
+            </script>
+            ''',
+            year=datetime.now().year
         )
+    )
 
 @app.route('/check_payment')
 def check_payment():
-                                                payment_id = session.get("payment_id")
-                                                if not payment_id:
-                                                    return redirect('/proxies')
+    payment_id = session.get("payment_id")
+    if not payment_id:
+        return redirect('/proxies')
 
-                                                conn = sqlite3.connect('payments.db')
-                                                c = conn.cursor()
-                                                c.execute("SELECT status, proxy_data, amount, quantity FROM payments WHERE payment_id=?", (payment_id,))
-                                                payment = c.fetchone()
-                                                conn.close()
+    conn = sqlite3.connect('payments.db')
+    c = conn.cursor()
+    c.execute("SELECT status, proxy_data, amount, quantity FROM payments WHERE payment_id=?", (payment_id,))
+    payment = c.fetchone()
+    conn.close()
 
-                                                if not payment:
-                                                    # Если платеж был удален, но прокси уже были сгенерированы - проверяем в сессии
-                                                    if 'proxies_data' in session:
-                                                        proxies_data = session['proxies_data']
-                                                        region_id = session.get("region_id")
-                                                        country_id = session.get("country_id")
-                                                        amount = session.get("amount")
-                                                        quantity = session.get("quantity")
+    if not payment:
+        if 'proxies_data' in session:
+            proxies_data = session['proxies_data']
+            region_id = session.get("region_id")
+            country_id = session.get("country_id")
+            amount = session.get("amount")
+            quantity = session.get("quantity")
+            country_name = _get_country_name(region_id, country_id)
 
-                                                        if region_id and country_id and region_id in PROXIES and country_id in PROXIES[region_id]["countries"]:
-                                                            proxy = PROXIES[region_id]["countries"][country_id]
-                                                            country_name = proxy["name"]
-                                                        else:
-                                                            proxy = {"name": "Неизвестная страна", "price": 0}
-                                                            country_name = "Неизвестная страна"
+            return render_template_string(
+                BASE_HTML.format(
+                    title=f"{country_name} прокси",
+                    content=PROXY_DETAIL_HTML,
+                    year=datetime.now().year
+                ),
+                proxies_data=proxies_data,
+                country_name=country_name,
+                quantity=quantity,
+                total_amount=amount
+            )
+        return redirect('/proxies')
 
-                                                        return render_template_string(
-                                                            BASE_HTML.format(
-                                                                title=f"{country_name} прокси",
-                                                                content=PROXY_DETAIL_HTML,
-                                                                year=datetime.now().year
-                                                            ),
-                                                            proxy=proxy,
-                                                            country_name=country_name,
-                                                            proxies_data=proxies_data,
-                                                            quantity=quantity,
-                                                            total_amount=amount
-                                                        )
-                                                    return redirect('/proxies')
+    status, proxy_data, amount, quantity = payment
 
-                                                status, proxy_data, amount, quantity = payment
+    if status == 'success':
+        try:
+            proxies_data = json.loads(proxy_data) if proxy_data else []
+            session['proxies_data'] = proxies_data
+            session['amount'] = amount
+            session['quantity'] = quantity
+        except (json.JSONDecodeError, ValueError):
+            proxies_data = []
 
-                                                if status == 'success':
-                                                    try:
-                                                        proxies_data = eval(proxy_data) if proxy_data else []
-                                                        # Сохраняем данные прокси в сессии на случай удаления записи
-                                                        session['proxies_data'] = proxies_data
-                                                        session['amount'] = amount
-                                                        session['quantity'] = quantity
-                                                    except:
-                                                        proxies_data = []
+        region_id = session.get("region_id")
+        country_id = session.get("country_id")
+        country_name = _get_country_name(region_id, country_id)
 
-                                                    region_id = session.get("region_id")
-                                                    country_id = session.get("country_id")
+        return render_template_string(
+            BASE_HTML.format(
+                title=f"{country_name} прокси",
+                content=PROXY_DETAIL_HTML,
+                year=datetime.now().year
+            ),
+            proxies_data=proxies_data,
+            country_name=country_name,
+            quantity=quantity,
+            total_amount=amount
+        )
 
-                                                    if region_id and country_id and region_id in PROXIES and country_id in PROXIES[region_id]["countries"]:
-                                                        proxy = PROXIES[region_id]["countries"][country_id]
-                                                        country_name = proxy["name"]
-                                                    else:
-                                                        proxy = {"name": "Неизвестная страна", "price": 0}
-                                                        country_name = "Неизвестная страна"
-
-                                                    return render_template_string(
-                                                        BASE_HTML.format(
-                                                            title=f"{country_name} прокси",
-                                                            content=PROXY_DETAIL_HTML,
-                                                            year=datetime.now().year
-                                                        ),
-                                                        proxy=proxy,
-                                                        country_name=country_name,
-                                                        proxies_data=proxies_data,
-                                                        quantity=quantity,
-                                                        total_amount=amount
-                                                    )
-                                                else:
-                                                    return render_template_string(
-                                                        BASE_HTML.format(
-                                                            title="Ожидание оплаты",
-                                                            content=f'''
-                                                            <section style="padding: 80px 0; text-align: center; min-height: calc(100vh - 200px);">
-                                                                <div class="container" style="max-width: 600px;">
-                                                                    <div style="background: var(--text-light); padding: 30px; border-radius: 12px; box-shadow: 0 5px 15px rgba(0,0,0,0.1);">
-                                                                        <h2 style="margin-bottom: 20px;">Платеж проверяется</h2>
-                                                                        <div style="margin-bottom: 30px;">
-                                                                            <p style="margin-bottom: 15px;">
-                                                                                Мы получили ваш платеж и проверяем его.<br>
-                                                                                Обычно это занимает до 15 минут.
-                                                                            </p>
-                                                                            <div style="background: var(--mint-super-light); padding: 15px; border-radius: 8px;">
-                                                                                <p>Номер вашего платежа: <strong>{payment_id}</strong></p>
-                                                                                <p>Сумма: <strong>{amount}₽</strong></p>
-                                                                                <p>Количество прокси: <strong>{quantity}</strong></p>
-                                                                            </div>
-                                                                        </div>
-                                                                        <div style="display: flex; justify-content: center; gap: 15px;">
-                                                                            <a href="/check_payment" class="btn">Проверить снова</a>
-                                                                            <a href="/" class="btn" style="background: var(--gray); color: var(--text-dark);">На главную</a>
-                                                                        </div>
-                                                                    </div>
-                                                                </div>
-                                                            </section>
-                                                            ''',
-                                                            year=datetime.now().year
-                                                        )
-                                                    )
+    return render_template_string(
+        BASE_HTML.format(
+            title="Ожидание оплаты",
+            content=f'''
+            <section style="padding: 80px 0; text-align: center; min-height: calc(100vh - 200px);">
+                <div class="container" style="max-width: 600px;">
+                    <div style="background: var(--text-light); padding: 30px; border-radius: 12px; box-shadow: 0 5px 15px rgba(0,0,0,0.1);">
+                        <h2 style="margin-bottom: 20px;">Платеж проверяется</h2>
+                        <div style="margin-bottom: 30px;">
+                            <p style="margin-bottom: 15px;">
+                                Мы получили ваш платеж и проверяем его.<br>
+                                Обычно это занимает до 15 минут.
+                            </p>
+                            <div style="background: var(--mint-super-light); padding: 15px; border-radius: 8px;">
+                                <p>Номер вашего платежа: <strong>{payment_id}</strong></p>
+                                <p>Сумма: <strong>{amount}₽</strong></p>
+                                <p>Количество прокси: <strong>{quantity}</strong></p>
+                            </div>
+                        </div>
+                        <div style="display: flex; justify-content: center; gap: 15px;">
+                            <a href="/check_payment" class="btn">Проверить снова</a>
+                            <a href="/" class="btn" style="background: var(--gray); color: var(--text-dark);">На главную</a>
+                        </div>
+                    </div>
+                </div>
+            </section>
+            ''',
+            year=datetime.now().year
+        )
+    )
 
 @app.route('/admin/login', methods=['GET', 'POST'])
 def admin_login():
     if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
+        username = request.form.get('username', '')
+        password = request.form.get('password', '')
 
         if username == ADMIN_USERNAME and check_password_hash(ADMIN_PASSWORD_HASH, password):
             session['admin_logged_in'] = True
@@ -881,41 +834,29 @@ def admin_login():
     ))
 
 @app.route('/admin')
+@login_required
 def admin_panel():
-    if not session.get('admin_logged_in'):
-        return redirect('/admin/login')
-
-    # Получаем и удаляем сообщение из сессии
     message = session.pop('admin_message', None)
     message_html = ""
     if message:
         text, category = message
         color = "#4CAF50" if category == "success" else "#F44336"
-        message_html = f"""
-        <div style="margin-bottom: 20px; padding: 15px; background-color: {color}20; border-left: 4px solid {color}; color: {color};">
-            {text}
-        </div>
-        """
+        message_html = f'''<div style="margin-bottom: 20px; padding: 15px; background-color: {color}20; border-left: 4px solid {color}; color: {color};">{text}</div>'''
 
     conn = sqlite3.connect('payments.db')
     c = conn.cursor()
-    # Выбираем только необходимые данные, исключая proxy_data
     c.execute("SELECT payment_id, region_id, country_id, amount, quantity, status, timestamp FROM payments ORDER BY timestamp DESC")
     payments = c.fetchall()
     conn.close()
 
     payment_rows = ""
-    for payment in payments:
-        payment_id, region_id, country_id, amount, quantity, status, timestamp = payment
+    for payment_id, region_id, country_id, amount, quantity, status, timestamp in payments:
         status_color = "#2ecc71" if status == "success" else "#e74c3c"
-
-        # Получаем название страны
-        country_name = "Неизвестно"
-        if region_id in PROXIES and country_id in PROXIES[region_id]["countries"]:
-            country_name = PROXIES[region_id]["countries"][country_id]["name"]
-
-        payment_rows += f"""
-        <tr>
+        country_name = _get_country_name(region_id, country_id)
+        
+        action_btn = f'<a href="/admin/confirm/{payment_id}" class="btn" style="padding: 5px 10px; font-size: 0.9rem; margin-right: 5px;">Подтвердить</a>' if status != "success" else '✅'
+        
+        payment_rows += f'''<tr>
             <td>{payment_id}</td>
             <td>{country_name}</td>
             <td>{amount}₽</td>
@@ -923,11 +864,10 @@ def admin_panel():
             <td style="color: {status_color}">{status}</td>
             <td>{timestamp}</td>
             <td style="white-space: nowrap;">
-                {f'<a href="/admin/confirm/{payment_id}" class="btn" style="padding: 5px 10px; font-size: 0.9rem; margin-right: 5px;">Подтвердить</a>' if status != "success" else '✅'}
+                {action_btn}
                 <a href="/admin/delete/{payment_id}" class="btn" style="padding: 5px 10px; font-size: 0.9rem; background-color: #e74c3c;">Удалить</a>
             </td>
-        </tr>
-        """
+        </tr>'''
 
     return render_template_string(BASE_HTML.format(
         title="Админ-панель",
@@ -966,35 +906,25 @@ def admin_panel():
     ))
 
 @app.route('/admin/delete/<payment_id>')
+@login_required
 def delete_payment(payment_id):
-        if not session.get('admin_logged_in'):
-            return redirect('/admin/login')
+    conn = sqlite3.connect('payments.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM payments WHERE payment_id=?", (payment_id,))
+    conn.commit()
+    conn.close()
 
-        conn = sqlite3.connect('payments.db')
-        c = conn.cursor()
+    session['admin_message'] = ('Платеж удален', 'success')
+    return redirect('/admin')
 
-        # Сначала получаем данные прокси перед удалением
-        c.execute("SELECT proxy_data FROM payments WHERE payment_id=?", (payment_id,))
-        proxy_data = c.fetchone()
-
-        # Затем удаляем запись
-        c.execute("DELETE FROM payments WHERE payment_id=?", (payment_id,))
-        conn.commit()
-        conn.close()
-
-        session['admin_message'] = ('Платеж удален', 'success')
-        return redirect('/admin')
 
 @app.route('/admin/confirm/<payment_id>')
+@login_required
 def confirm_payment(payment_id):
-    if not session.get('admin_logged_in'):
-        return redirect('/admin/login')
-
     conn = sqlite3.connect('payments.db')
     c = conn.cursor()
 
     try:
-        # Получаем только необходимые данные (без proxy_data)
         c.execute("SELECT region_id, country_id, quantity FROM payments WHERE payment_id=?", (payment_id,))
         payment_info = c.fetchone()
 
@@ -1003,38 +933,61 @@ def confirm_payment(payment_id):
             return redirect('/admin')
 
         region_id, country_id, quantity = payment_info
+        proxies_data = _generate_proxy_data(quantity)
 
-        # Генерируем данные прокси, но не показываем их в админке
-        proxies_data = []
-        for _ in range(quantity):
-            proxy_data = {
-                "ip": ".".join(str(random.randint(0, 255)) for _ in range(4)),
-                "port": random.randint(1000, 9999),
-                "login": f"user{random.randint(1000,9999)}",
-                "password": f"pass{random.randint(10000,99999)}"
-            }
-            proxies_data.append(proxy_data)
-
-        # Обновляем запись в базе данных
         c.execute("UPDATE payments SET status=?, proxy_data=? WHERE payment_id=?",
-                 ('success', str(proxies_data), payment_id))
+                 ('success', json.dumps(proxies_data), payment_id))
         conn.commit()
 
-        # Сохраняем сообщение в сессии
         session['admin_message'] = ('Платеж подтвержден! Данные прокси сгенерированы.', 'success')
 
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
+    except sqlite3.Error:
         session['admin_message'] = ('Ошибка при подтверждении платежа', 'error')
     finally:
         conn.close()
 
     return redirect('/admin')
 
+
 @app.route('/admin/logout')
+@login_required
 def admin_logout():
-        session.pop('admin_logged_in', None)
-        return redirect('/admin/login')
+    session.pop('admin_logged_in', None)
+    return redirect('/admin/login')
 
 if __name__ == '__main__':
-        app.run(host='0.0.0.0', port=8080)
+    app.run(host='0.0.0.0', port=8080, debug=False)
+
+
+@app.errorhandler(404)
+def page_not_found(error):
+    return render_template_string(BASE_HTML.format(
+        title="Страница не найдена",
+        content='''
+        <section style="padding: 80px 0; text-align: center; min-height: calc(100vh - 200px);">
+            <div class="container">
+                <h1 style="font-size: 3rem; margin-bottom: 20px;">404</h1>
+                <p style="font-size: 1.3rem; margin-bottom: 30px;">Страница не найдена</p>
+                <a href="/" class="btn">Вернуться на главную</a>
+            </div>
+        </section>
+        ''',
+        year=datetime.now().year
+    )), 404
+
+
+@app.errorhandler(500)
+def server_error(error):
+    return render_template_string(BASE_HTML.format(
+        title="Ошибка сервера",
+        content='''
+        <section style="padding: 80px 0; text-align: center; min-height: calc(100vh - 200px);">
+            <div class="container">
+                <h1 style="font-size: 3rem; margin-bottom: 20px;">500</h1>
+                <p style="font-size: 1.3rem; margin-bottom: 30px;">Внутренняя ошибка сервера</p>
+                <a href="/" class="btn">Вернуться на главную</a>
+            </div>
+        </section>
+        ''',
+        year=datetime.now().year
+    )), 500
